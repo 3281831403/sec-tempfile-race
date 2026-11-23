@@ -17,10 +17,18 @@
 - 清理与所有者校验只接受精确边界，不做前缀、用户名或路径猜测。
 """
 
-import hashlib
 import os
 import stat
 import tempfile
+
+#: 允许的最高权限位：仅所有者可读写。
+_MAX_MODE = 0o600
+
+
+def _check_mode(mode: int) -> None:
+    """mode 含 0o600 之外的位时抛 ValueError，容差 0。"""
+    if mode & ~_MAX_MODE:
+        raise ValueError(f"mode 不得宽于 0o600: {mode!r}")
 
 
 def candidate_name(directory: str, prefix: str, suffix: str) -> str:
@@ -32,7 +40,7 @@ def candidate_name(directory: str, prefix: str, suffix: str) -> str:
     create_exclusive 的独占创建保证。
     容差 0：prefix 与 suffix 逐字符保留，不追加、不截断、不改写。
     """
-    raise NotImplementedError
+    return os.path.join(directory, f"{prefix}{suffix}")
 
 
 def create_exclusive(path: str, mode: int) -> int:
@@ -44,7 +52,11 @@ def create_exclusive(path: str, mode: int) -> int:
     0o600 之外的位必须抛 ValueError。独占创建失败后禁止回退到普通打开，竞态
     必须原样暴露。权限容差为 0。
     """
-    raise NotImplementedError
+    _check_mode(mode)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(path, flags, mode)
 
 
 def write_atomic(path: str, data: bytes, mode: int) -> str:
@@ -56,7 +68,28 @@ def write_atomic(path: str, data: bytes, mode: int) -> str:
     path 上不得出现半截内容。
     mode 只允许 0o600 以内的位；最终权限必须精确等于 mode，容差 0。
     """
-    raise NotImplementedError
+    _check_mode(mode)
+    if os.path.lexists(path):
+        raise FileExistsError(f"目标已存在，拒绝覆盖: {path}")
+    directory = os.path.dirname(os.path.abspath(path))
+    descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".export-")
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def set_permissions(path: str, mode: int) -> None:
@@ -67,7 +100,8 @@ def set_permissions(path: str, mode: int) -> None:
     校验通过后调用 os.chmod(path, mode)。权限容差为 0：不做掩码截断、不做
     静默降级，也不接受 0o755、0o777 等过宽模式。
     """
-    raise NotImplementedError
+    _check_mode(mode)
+    os.chmod(path, mode)
 
 
 def cleanup(path: str) -> bool:
@@ -78,7 +112,21 @@ def cleanup(path: str) -> bool:
     符号链接。路径不存在时返回 False。
     容差 0：边界按完整路径判断，不用字符串前缀或包含关系放宽。
     """
-    raise NotImplementedError
+    root = os.path.realpath(tempfile.gettempdir())
+    target = os.path.realpath(path)
+    if target != root and not target.startswith(root + os.sep):
+        return False
+    try:
+        status = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(status.st_mode):
+        return False
+    try:
+        os.unlink(path)
+    except OSError:
+        return False
+    return True
 
 
 def verify_owner(path: str, expected_uid: int) -> bool:
@@ -88,7 +136,10 @@ def verify_owner(path: str, expected_uid: int) -> bool:
     名字符串，否则同名用户会被误判。文件不存在或无法 stat 时返回 False，不抛
     异常。容差 0：uid 不相等即返回 False。
     """
-    raise NotImplementedError
+    try:
+        return os.stat(path).st_uid == expected_uid
+    except OSError:
+        return False
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -103,7 +154,22 @@ def validate_policy(policy: dict) -> list[str]:
     只返回上述三个稳定代码。容差 0：按完整模式位判断，不做前缀、白名单或
     静默放行。
     """
-    raise NotImplementedError
+    problems = []
+    if policy.get("overwrite", False):
+        problems.append("overwrite_allowed")
+    if policy.get("mode", _MAX_MODE) & ~_MAX_MODE:
+        problems.append("mode_too_wide")
+    try:
+        status = os.stat(policy["directory"])
+    except (OSError, KeyError, TypeError):
+        status = None
+    if (
+        status is not None
+        and stat.S_ISDIR(status.st_mode)
+        and status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        problems.append("directory_writable_by_others")
+    return problems
 
 
 def export_batch(items: list, policy: dict) -> dict:
@@ -117,4 +183,17 @@ def export_batch(items: list, policy: dict) -> dict:
     单条失败只把原因写入 problems，不中断其余条目；exported 按输入顺序记录成功
     条目的最终路径。容差 0：每个成功文件的内容与权限必须与单独导出完全一致。
     """
-    raise NotImplementedError
+    directory = policy["directory"]
+    prefix = policy.get("prefix", "")
+    mode = policy.get("mode", _MAX_MODE)
+    exported = []
+    problems = []
+    for item in items:
+        try:
+            path = candidate_name(directory, prefix, item["suffix"])
+            write_atomic(path, item["data"], mode)
+        except Exception as exc:
+            problems.append(f"{item.get('name', '?')}: {exc}")
+        else:
+            exported.append(path)
+    return {"exported": exported, "problems": problems}
